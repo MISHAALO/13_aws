@@ -1,0 +1,111 @@
+name: AWS infrastructure
+  hosts: localhost
+  gather_facts: False
+  vars:
+    iam_prifile_name: user
+    keypair: WindowsBook
+    instance_type: t2.micro
+    image: ami-0ac80df6ef0fr70f
+    group: group
+    region: us-east-1
+
+  tasks:
+    - name: Provision a set of instances
+      ec2:
+        instance_profile_name: "{{ iam_prifile_name }}"
+        key_name: "{{ keypair }}"
+        group: "{{ group }}"
+        instance_type: "{{ instance_type }}"
+        image: "{{ image }}"
+        region: "{{ region }}"
+        user_data: "apt update && apt install python -y"
+        wait: true
+        exact_count: 2
+        count_tag:
+          Name: test123
+        instance_tags:
+          Name: test123
+      register: ec2
+
+    - name: Add all instance buld group
+      add_host: hostname={{ ec2.instances[0].public_ip }} groups=ec2_build
+    - name: Add all instance production group
+      add_host: hostname={{ ec2.instances[1].public_ip }} groups=ec2_prod
+
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_dns_name }} port=22 delay=60 timeout=320 state=started
+      loop: "{{ ec2.instances }}"
+
+    - name: Add nodes to known hosts
+      shell: ssh-keyscan -H {{ item.public_ip }} >> ~/.ssh/known_hosts
+      loop: "{{ ec2.instances }}"
+
+     - name: Ensure S3 bucket presented
+      s3_bucket:
+        name: artifacts1
+        state: present
+`
+
+- name: Configuration of build node
+  hosts: ec2_build
+  remote_user: ubuntu
+  gather_facts: true
+
+  tasks:
+    - name: git and maven
+      become: true
+      apt:
+        update_cache: yes
+        name:
+          - git
+          - maven
+          - python3-pip
+        state: present
+
+    - name: installing boto3
+      shell: pip3 install --upgrade boto3
+
+    - name: clone repository
+      git:
+        repo: https://github.com/boxfuse/boxfuse-sample-java-war-hello.git
+        dest: /tmp/boxfuse-sample-java-war-hello
+
+    - name: build war
+      shell: mvn -f /tmp/boxfuse-sample-java-war-hello package
+
+    - name: artifact copied
+      aws_s3:
+        bucket: artifacts1
+        object: hello-1.0.war
+        src: /tmp/boxfuse-sample-java-war-hello/target/hello-1.0.war
+        mode: put
+
+
+- name: Configure production server
+  hosts: ec2_prod
+  user: ubuntu
+  become: yes
+
+  tasks:
+    - name: Ensure tomcat package is present
+      apt:
+        update_cache: yes
+        name:
+          - tomcat9
+          - python3-pip
+        state: present
+
+    - name: istalling boto3
+      shell: pip3 install --upgrade boto3
+
+     - name:  implement transfer artifact to server
+      aws_s3:
+        bucket: artifacts1
+        object: hello-1.0.war
+        dest: /var/lib/tomcat9/webapps/hello-1.0.war
+        mode: get
+
+    - name: Tomcat
+      service:
+        name: tomcat9
+        state: started
